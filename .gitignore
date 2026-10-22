@@ -1,0 +1,16 @@
+.env
+backup/
+docker-compose.rc.yml
+.codegraph/
+data/sessions/*
+!data/sessions/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+tsh/*/tsh
+__pycache__/
+node_modules/
+dist/
+frontend/src/main.js
+frontend/src/main.d.ts
+frontend/src/main.js.map
+*.tsbuildinfo

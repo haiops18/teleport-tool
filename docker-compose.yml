@@ -1,0 +1,112 @@
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    networks:
+      - teleport-scanner-net
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping --protocol=tcp -h 127.0.0.1 -P 3306 -uroot -p$$MYSQL_ROOT_PASSWORD
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+  backend:
+    image: teleport-cgroup-scanner-backend:20261022-p0
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      SESSION_ROOT: /data/sessions
+      EXPORT_ROOT: /data/exports
+    volumes:
+      - ./tsh:/opt/tsh:ro
+      - ./data/sessions:/data/sessions
+      - ./data/exports:/data/exports
+    networks:
+      - teleport-scanner-net
+      - teleport-egress
+    depends_on:
+      mysql: {condition: service_healthy}
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  frontend:
+    image: teleport-cgroup-scanner-frontend:20261022-p0
+    restart: unless-stopped
+    networks:
+      - teleport-scanner-net
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1:8080/
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "9999:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - teleport-scanner-net
+      - teleport-edge
+    depends_on:
+      backend: {condition: service_healthy}
+      frontend: {condition: service_healthy}
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - CHOWN
+      - SETUID
+      - SETGID
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "wget -q -O /dev/null http://127.0.0.1/ || exit 1"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+networks:
+  teleport-scanner-net:
+    internal: true
+  teleport-egress: {}
+  teleport-edge: {}
+volumes:
+  mysql-data:
