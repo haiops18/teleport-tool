@@ -95,4 +95,11 @@ has_table audit_logs || mysql_exec <<'SQL'
 CREATE TABLE audit_logs (id BIGINT AUTO_INCREMENT PRIMARY KEY, timestamp DATETIME NOT NULL, username VARCHAR(255) NOT NULL, role VARCHAR(16) NOT NULL, action VARCHAR(64) NOT NULL, target_type VARCHAR(64), target_count INT NOT NULL DEFAULT 0, job_id VARCHAR(36), result VARCHAR(32) NOT NULL, source_ip VARCHAR(64), details TEXT, INDEX ix_audit_timestamp (timestamp), INDEX ix_audit_username (username));
 SQL
 printf '%s\n' "INSERT IGNORE INTO schema_migrations(version) VALUES ('010_auth_rbac_audit');" | mysql_exec
+
+# 011: P2 operator efficiency state and report indexes.
+if ! has_table saved_views || ! has_table export_jobs || ! has_table scheduled_checks; then mysql_exec < "$ROOT_DIR/mysql/migrations/011_p2_efficiency.sql"; fi
+has_index nodes ix_nodes_session_hostname || printf '%s\n' 'CREATE INDEX ix_nodes_session_hostname ON nodes (session_id, hostname);' | mysql_exec
+has_index scan_results ix_scan_results_job_node_status || printf '%s\n' 'CREATE INDEX ix_scan_results_job_node_status ON scan_results (scan_job_id, node_id, status);' | mysql_exec
+has_index compute_discovery_results ix_compute_discovery_results_session_node_time || printf '%s\n' 'CREATE INDEX ix_compute_discovery_results_session_node_time ON compute_discovery_results (session_id, node_id, discovered_at, id);' | mysql_exec
+printf '%s\n' "INSERT IGNORE INTO schema_migrations(version) VALUES ('011_p2_efficiency');" | mysql_exec
 ok 'Database schema is current.'

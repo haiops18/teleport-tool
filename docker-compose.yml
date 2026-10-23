@@ -21,7 +21,7 @@ services:
       retries: 10
       start_period: 30s
   backend:
-    image: teleport-cgroup-scanner-backend:20261022-p0
+    image: teleport-cgroup-scanner-backend:20261022-p2
     restart: unless-stopped
     env_file: .env
     environment:
@@ -51,7 +51,7 @@ services:
       timeout: 5s
       retries: 5
   frontend:
-    image: teleport-cgroup-scanner-frontend:20261022-p0
+    image: teleport-cgroup-scanner-frontend:20261022-p2
     restart: unless-stopped
     networks:
       - teleport-scanner-net

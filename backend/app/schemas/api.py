@@ -8,7 +8,7 @@ class LoginRequest(BaseModel):
     otp: str|None = Field(default=None,max_length=32)
 class ScanRequest(BaseModel): node_ids: list[int] = []
 class ComputeDiscoveryRequest(BaseModel):
-    node_ids: list[int] = Field(min_length=1,max_length=500)
+    node_ids: list[int] = Field(min_length=1,max_length=1800)
     job_name: str|None = Field(default=None,max_length=150)
 
     @field_validator('job_name')

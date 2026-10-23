@@ -13,7 +13,9 @@ class Settings(BaseSettings):
     scan_timeout_seconds: int = 60
     discovery_max_concurrency: int = 5
     discovery_batch_size: int = 10
-    discovery_max_nodes_per_request: int = 100
+    # Large requests are executed in bounded batches; this is a request cap, not
+    # the number of SSH sessions started at once.
+    discovery_max_nodes_per_request: int = 1800
     discovery_scan_timeout_seconds: int = 60
     service_config_max_concurrency: int = 5
     service_config_batch_size: int = 10

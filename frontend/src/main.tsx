@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import axios from "axios";
 import {
@@ -24,16 +24,42 @@ type Node = {
   scan_status?: string;
 };
 const statusOf = (n: Node) => n.status || n.scan_status || "UNKNOWN";
-const Badge = ({ status }: { status: string }) => (
-  <span className={"badge " + status}>{status}</span>
-);
+const statusLabel: Record<string, string> = {
+  SAFE: "AN TOÀN",
+  WARNING: "CẢNH BÁO",
+  ERROR: "LỖI",
+  UNREACHABLE: "KHÔNG KẾT NỐI",
+  UNKNOWN: "CHƯA RÕ",
+  QUEUED: "ĐANG CHỜ",
+  PENDING: "ĐANG CHỜ",
+  SCANNING: "ĐANG QUÉT",
+  RUNNING: "ĐANG CHẠY",
+  COMPLETED: "HOÀN THÀNH",
+  FAILED: "THẤT BẠI",
+  CANCELLED: "ĐÃ HỦY",
+  CONFIGURED: "ĐÃ CẤU HÌNH",
+  NOT_CONFIGURED: "CHƯA CẤU HÌNH",
+  DETECTED: "ĐÃ PHÁT HIỆN",
+  NOT_DETECTED: "KHÔNG PHÁT HIỆN",
+  NOT_SCANNED: "CHƯA QUÉT",
+  ONLINE: "TRỰC TUYẾN",
+  OFFLINE: "NGOẠI TUYẾN",
+};
+const Badge = ({ status }: { status: string }) => {
+  const normalized = status || "UNKNOWN";
+  return (
+    <span className={"badge " + normalized} aria-label={`Trạng thái: ${statusLabel[normalized] || normalized}`}>
+      {statusLabel[normalized] || normalized}
+    </span>
+  );
+};
 const Card = ({ title, value }: { title: string; value: React.ReactNode }) => (
   <div className="card">
     <small>{title}</small>
     <strong>{value ?? "—"}</strong>
   </div>
 );
-const time = (v?: string) => (v ? new Date(v).toLocaleString() : "Never");
+const time = (v?: string) => (v ? new Date(v).toLocaleString("vi-VN") : "Chưa có");
 async function download(url: string) {
   const r = await api.get(url, { responseType: "blob" }),
     d = r.headers["content-disposition"] || "",
@@ -47,6 +73,54 @@ async function download(url: string) {
   URL.revokeObjectURL(u);
 }
 type AppRole = "VIEWER" | "OPERATOR" | "ADMIN";
+
+function Dialog({
+  title,
+  children,
+  onClose,
+}: {
+  title: string;
+  children: React.ReactNode;
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = `dialog-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    const first = dialog?.querySelector<HTMLElement>("[autofocus], input, select, button:not([disabled])");
+    first?.focus();
+  }, []);
+  const trapFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const focusable = Array.from(
+      dialogRef.current?.querySelectorAll<HTMLElement>(
+        "button:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex='-1'])",
+      ) || [],
+    );
+    if (!focusable.length) return;
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  return (
+    <div className="modal" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div ref={dialogRef} className="modal-card" role="dialog" aria-modal="true" aria-labelledby={titleId} onKeyDown={trapFocus}>
+        <h3 id={titleId}>{title}</h3>
+        {children}
+      </div>
+    </div>
+  );
+}
 function Login({ ok }: { ok: (role: AppRole) => void }) {
   const [f, setF] = useState({
       proxy: "",
@@ -131,7 +205,15 @@ function Labels({ labels }: { labels?: Record<string, string> }) {
     </div>
   );
 }
-function Nodes({ openReport, role }: { openReport: (id: number) => void; role: AppRole }) {
+function Nodes({
+  openReport,
+  role,
+  scanMode = false,
+}: {
+  openReport: (id: number) => void;
+  role: AppRole;
+  scanMode?: boolean;
+}) {
   const [search, setSearch] = useState(""),
     [term, setTerm] = useState(""),
     [page, setPage] = useState(1),
@@ -161,13 +243,13 @@ function Nodes({ openReport, role }: { openReport: (id: number) => void; role: A
         .then((r) => r.data),
   });
   const refresh = async () => {
-    setNotice("Refreshing nodes…");
+      setNotice("Đang tải lại node…");
     try {
       await api.post("/nodes/refresh");
       await nodes.refetch();
-      setNotice("Node list refreshed.");
+      setNotice("Đã tải lại danh sách node.");
     } catch {
-      setNotice("Unable to refresh node list.");
+      setNotice("Không thể tải lại danh sách node.");
     }
   };
   useEffect(() => {
@@ -243,57 +325,59 @@ function Nodes({ openReport, role }: { openReport: (id: number) => void; role: A
   return (
     <section>
       <header>
-        <h1>Nodes</h1>
+        <h1>{scanMode ? "Quét tiến trình" : "Nodes"}</h1>
         <div className="refresh-control">
           <label>
-            Auto load
+            Tự động tải lại
             <select
               value={automatic}
               onChange={(e) => setAutomatic(e.target.value)}
             >
-              <option value="1">1 minute</option>
-              <option value="3">3 minutes</option>
-              <option value="5">5 minutes</option>
-              <option value="off">Off</option>
+              <option value="1">1 phút</option>
+              <option value="3">3 phút</option>
+              <option value="5">5 phút</option>
+              <option value="off">Tắt</option>
             </select>
           </label>
-          <button onClick={refresh}>Refresh Now</button>
+          <button onClick={refresh}>Tải lại</button>
         </div>
       </header>
       <div className="cards">
-        <Card title="Total Nodes" value={total} />
-        <Card title="Last Refresh" value={time(nodes.data?.last_refresh)} />
+        <Card title="Tổng số node" value={total} />
+        <Card title="Lần tải gần nhất" value={time(nodes.data?.last_refresh)} />
       </div>
       <input
         className="node-search"
-        placeholder="Search hostname, node name, IP or labels…"
+        aria-label="Tìm node"
+        placeholder="Tìm hostname, tên node, IP hoặc nhãn…"
         value={search}
         onChange={(e) => setSearch(e.target.value)}
       />
       {notice && <p className="notice">{notice}</p>}
-      <div className="selection-bar">
+      {scanMode && <div className="selection-bar">
         <span>
-          {selected.size} {selected.size === 1 ? "node" : "nodes"} selected
+          Đã chọn {selected.size} node
         </span>
         <button disabled={!selected.size || role === "VIEWER"} title={role === "VIEWER" ? "Viewer chỉ có quyền xem" : undefined} onClick={() => scan([...selected])}>
-          Scan Selected{selected.size ? ` (${selected.size})` : ""}
+          Quét đã chọn{selected.size ? ` (${selected.size})` : ""}
         </button>
         <button
           className="secondary"
           disabled={!selected.size}
           onClick={() => setSelected(new Set())}
         >
-          Clear Selection
+          Bỏ chọn
         </button>
-      </div>
+      </div>}
       {nodes.isLoading ? (
-        <p>Loading nodes…</p>
+        <p>Đang tải node…</p>
       ) : nodes.isError ? (
-        <p className="error">Unable to load nodes.</p>
+        <p className="error">Không thể tải danh sách node.</p>
       ) : !rows.length ? (
-        <p>No nodes found.</p>
+        <p>Không tìm thấy node.</p>
       ) : (
         <table>
+          <caption className="sr-only">Danh sách node Teleport và trạng thái quét gần nhất</caption>
           <thead>
             <tr>
               <th>
@@ -309,12 +393,12 @@ function Nodes({ openReport, role }: { openReport: (id: number) => void; role: A
                   onChange={togglePage}
                 />
               </th>
-              <th>Hostname</th>
-              <th>IP</th>
-              <th>Labels</th>
-              <th>Last Scan</th>
-              <th>Status</th>
-              <th>Action</th>
+              <th scope="col">Hostname</th>
+              <th scope="col">IP</th>
+              <th scope="col">Nhãn</th>
+              <th scope="col">Lần quét gần nhất</th>
+              <th scope="col">Trạng thái</th>
+              <th scope="col">Thao tác</th>
             </tr>
           </thead>
           <tbody>
@@ -356,16 +440,16 @@ function Nodes({ openReport, role }: { openReport: (id: number) => void; role: A
                     )}
                   </td>
                   <td>
-                    <button disabled={pending || role === "VIEWER"} title={role === "VIEWER" ? "Viewer chỉ có quyền xem" : undefined} onClick={() => scan([n.id])}>
+                    {scanMode && <button disabled={pending || role === "VIEWER"} title={role === "VIEWER" ? "Viewer chỉ có quyền xem" : undefined} onClick={() => scan([n.id])}>
                       {pending ? (
                         <>
                           <i className="spinner" />{" "}
-                          {status === "QUEUED" ? "Queued" : "Scanning…"}
+                          {status === "QUEUED" ? "Đang chờ" : "Đang quét…"}
                         </>
                       ) : (
-                        "Scan"
+                        "Quét"
                       )}
-                    </button>
+                    </button>}
                   </td>
                 </tr>
               );
@@ -375,11 +459,11 @@ function Nodes({ openReport, role }: { openReport: (id: number) => void; role: A
       )}
       <div className="pagination">
         <span>
-          Showing {total ? (page - 1) * pageSize + 1 : 0}–
-          {Math.min(page * pageSize, total)} of {total}
+          Hiển thị {total ? (page - 1) * pageSize + 1 : 0}–
+          {Math.min(page * pageSize, total)} / {total}
         </span>
         <label>
-          Page size{" "}
+          Số dòng/trang{" "}
           <select
             value={pageSize}
             onChange={(e) => {
@@ -397,17 +481,17 @@ function Nodes({ openReport, role }: { openReport: (id: number) => void; role: A
           disabled={page === 1}
           onClick={() => setPage(page - 1)}
         >
-          Previous
+          Trước
         </button>
         <span>
-          Page {page} / {pages}
+          Trang {page} / {pages}
         </span>
         <button
           className="secondary"
           disabled={page >= pages}
           onClick={() => setPage(page + 1)}
         >
-          Next
+          Sau
         </button>
       </div>
     </section>
@@ -785,6 +869,11 @@ function Jobs() {
     await api.post(`/scan/${id}/cancel`);
     await scans.refetch();
   };
+  const retryFailed = async (job: any) => {
+    const path = job.kind === "CGROUP SCAN" ? `/scan/${job.id}/retry-failed` : `/compute-discovery/jobs/${job.id}/retry-failed`;
+    await api.post(path);
+    await Promise.all([scans.refetch(), discoveries.refetch()]);
+  };
   const all = [
     ...(scans.data || []).map((x: any) => ({
       ...x,
@@ -816,7 +905,7 @@ function Jobs() {
   return (
     <section>
       <header>
-        <h1>Running Job</h1>
+        <h1>Jobs</h1>
         <button
           className="secondary"
           onClick={() => {
@@ -825,12 +914,12 @@ function Jobs() {
             discoveries.refetch();
           }}
         >
-          Refresh
+          Tải lại
         </button>
       </header>
       <p className="notice">
         Cgroup Scan và Service Config tiếp tục chạy trên backend khi đổi trang.
-        Chọn View để theo dõi từng node trong job.
+        Chọn Xem để theo dõi từng node trong job.
       </p>
       {detail && (detail.kind === "COMPUTE DISCOVERY" ? <DiscoveryJobDetail job={detail} onClose={() => setDetail(undefined)} /> : <JobDetail job={detail} onClose={() => setDetail(undefined)} />)}
       {!all.length ? (
@@ -870,7 +959,7 @@ function Jobs() {
                 <td>{job.error}</td>
                 <td>
                   <button className="secondary" onClick={() => setDetail(job)}>
-                    View
+                    Xem
                   </button>
                   {job.kind === "CGROUP SCAN" && (
                     <button
@@ -882,6 +971,9 @@ function Jobs() {
                     >
                       Stop
                     </button>
+                  )}
+                  {(["CGROUP SCAN", "COMPUTE DISCOVERY"].includes(job.kind) && Number(job.error || 0) > 0) && (
+                    <button className="secondary" onClick={() => retryFailed(job)}>Thử lại node lỗi</button>
                   )}
                 </td>
               </tr>
@@ -1056,17 +1148,17 @@ function ServiceConfig({ role }: { role: AppRole }) {
   return (
     <section>
       <header>
-        <h1>Service Config</h1>
-        <button onClick={() => data.refetch()}>Refresh Status</button>
+        <h1>Cấu hình dịch vụ</h1>
+        <button onClick={() => data.refetch()}>Tải lại trạng thái</button>
       </header>
       <div className="cards">
-        <Card title="Total Nodes" value={data.data?.total} />
+        <Card title="Tổng số node" value={data.data?.total} />
         <Card
-          title="Checked"
+          title="Đã kiểm tra"
           value={rows.filter((x: any) => x.config_status !== "UNKNOWN").length}
         />
         <Card
-          title="Configured"
+          title="Đã cấu hình"
           value={
             rows.filter(
               (x: any) =>
@@ -1076,7 +1168,7 @@ function ServiceConfig({ role }: { role: AppRole }) {
           }
         />
         <Card
-          title="Need Configuration"
+          title="Cần cấu hình"
           value={
             rows.filter((x: any) => x.config_status === "NOT_CONFIGURED").length
           }
@@ -1084,24 +1176,25 @@ function ServiceConfig({ role }: { role: AppRole }) {
       </div>
       <input
         className="node-search"
-        placeholder="Search node name, hostname, IP or label…"
+        aria-label="Tìm node cấu hình dịch vụ"
+        placeholder="Tìm tên node, hostname, IP hoặc nhãn…"
         value={q}
         onChange={(e) => setQ(e.target.value)}
       />
       <div className="selection-bar">
-        <span>{selected.size} nodes selected</span>
+        <span>Đã chọn {selected.size} node</span>
         <button
           disabled={!selected.size || role === "VIEWER"}
           onClick={() => run("check", [...selected])}
         >
-          Check Selected
+          Kiểm tra đã chọn
         </button>
         <button
           disabled={!selected.size || role !== "ADMIN"}
           title={role !== "ADMIN" ? "Chỉ Admin có thể áp dụng cấu hình" : undefined}
           onClick={() => run("configure", [...selected])}
         >
-          Configure Selected
+          Cấu hình đã chọn
         </button>
         <label>
           <input
@@ -1109,16 +1202,16 @@ function ServiceConfig({ role }: { role: AppRole }) {
             checked={restart}
             onChange={(e) => setRestart(e.target.checked)}
           />{" "}
-          Restart after apply
+          Khởi động lại sau khi áp dụng
         </label>
         <button className="secondary" onClick={() => setSelected(new Set())}>
-          Clear
+          Bỏ chọn
         </button>
       </div>
       {notice && <p className="notice">{notice}</p>}
-      {confirmation && <div className="modal" role="dialog" aria-modal="true" aria-labelledby="configure-title"><div className="modal-card"><h3 id="configure-title">Review Service Configuration</h3><p><strong>Affected nodes:</strong> {confirmation.length}</p><p><strong>Target:</strong> KillMode=process (systemd override)</p><p><strong>Restart requested:</strong> {restart ? "Yes — Teleport connections may be interrupted." : "No"}</p><p className="notice">This action changes remote service configuration. Review the impact before continuing.</p><label>Job name (optional)<input autoFocus maxLength={150} value={jobName} onChange={(e) => setJobName(e.target.value)} /></label><label>Type <code>APPLY CONFIGURATION</code> to confirm<input value={typedConfirmation} onChange={(e) => setTypedConfirmation(e.target.value)} /></label><div className="dialog-actions"><button className="secondary" disabled={submitting} onClick={() => { setConfirmation(null); setJobName(""); setTypedConfirmation(""); }}>Cancel</button><button disabled={submitting || typedConfirmation !== "APPLY CONFIGURATION"} onClick={submitConfiguration}>{submitting ? "Applying…" : restart ? "Apply & Restart Teleport" : "Apply Configuration"}</button></div></div></div>}
+      {confirmation && <Dialog title="Xác nhận cấu hình dịch vụ" onClose={() => { if (!submitting) { setConfirmation(null); setJobName(""); setTypedConfirmation(""); } }}><p><strong>Node ảnh hưởng:</strong> {confirmation.length}</p><p><strong>Đích áp dụng:</strong> KillMode=process (systemd override)</p><p><strong>Yêu cầu khởi động lại:</strong> {restart ? "Có — kết nối Teleport có thể bị gián đoạn." : "Không"}</p><p className="notice">Thao tác này thay đổi cấu hình dịch vụ từ xa. Hãy xem lại tác động trước khi tiếp tục.</p><label>Tên job (không bắt buộc)<input autoFocus maxLength={150} value={jobName} onChange={(e) => setJobName(e.target.value)} /></label><label>Nhập <code>APPLY CONFIGURATION</code> để xác nhận<input value={typedConfirmation} onChange={(e) => setTypedConfirmation(e.target.value)} /></label><div className="dialog-actions"><button className="secondary" disabled={submitting} onClick={() => { setConfirmation(null); setJobName(""); setTypedConfirmation(""); }}>Hủy</button><button disabled={submitting || typedConfirmation !== "APPLY CONFIGURATION"} onClick={submitConfiguration}>{submitting ? "Đang áp dụng…" : restart ? "Áp dụng & khởi động lại Teleport" : "Áp dụng cấu hình"}</button></div></Dialog>}
       {data.isLoading ? (
-        <p>Loading configuration…</p>
+        <p>Đang tải cấu hình…</p>
       ) : (
         <table>
           <thead>
@@ -1170,12 +1263,12 @@ function ServiceConfig({ role }: { role: AppRole }) {
                 <td>{n.service_state || "—"}</td>
                 <td>{time(n.last_check)}</td>
                 <td>
-                  <button onClick={() => run("check", [n.id])}>Check</button>{" "}
+                  <button onClick={() => run("check", [n.id])}>Kiểm tra</button>{" "}
                   <button
                     disabled={n.config_status === "CONFIGURED"}
                     onClick={() => run("configure", [n.id])}
                   >
-                    Configure
+                    Cấu hình
                   </button>
                 </td>
               </tr>
@@ -1427,19 +1520,16 @@ function ReportUI({
         <p>No scanned hosts found for the selected filters.</p>
       )}
       {confirm && (
-        <div className="modal">
-          <div className="modal-card">
-            <h3>Remove {confirm.length} node(s) from Report?</h3>
+        <Dialog title={`Xóa ${confirm.length} node khỏi báo cáo?`} onClose={() => setConfirm(null)}>
             <p>
-              This removes application report/history data only. Teleport nodes
-              and agents are not changed or restarted.
+              Chỉ xóa dữ liệu báo cáo/lịch sử của ứng dụng. Node và agent
+              Teleport không bị thay đổi hoặc khởi động lại.
             </p>
             <button className="secondary" onClick={() => setConfirm(null)}>
-              Cancel
+              Hủy
             </button>{" "}
-            <button onClick={remove}>Remove</button>
-          </div>
-        </div>
+            <button onClick={remove}>Xóa báo cáo</button>
+        </Dialog>
       )}
     </section>
   );
@@ -1785,7 +1875,7 @@ function ConfigReport() {
   );
 }
 function ComputeDiscovery({ role }: { role: AppRole }) {
-  const [page, setPage] = useState(1), pageSize = 25, [search,setSearch]=useState(""), [term,setTerm]=useState(""), [discoveryStatus,setDiscoveryStatus]=useState("");
+  const [page, setPage] = useState(1), [pageSize,setPageSize] = useState(25), [search,setSearch]=useState(""), [term,setTerm]=useState(""), [discoveryStatus,setDiscoveryStatus]=useState(""), [saveDialog,setSaveDialog]=useState(false), [viewName,setViewName]=useState(""), [scheduleDialog,setScheduleDialog]=useState(false), [scheduleName,setScheduleName]=useState(""), [scheduleMinutes,setScheduleMinutes]=useState("60");
   useEffect(()=>{const timer=window.setTimeout(()=>{setTerm(search);setPage(1)},400);return()=>clearTimeout(timer)},[search]);
   const nodes = useQuery({
       queryKey: ["compute-nodes", page, term, discoveryStatus],
@@ -1794,7 +1884,10 @@ function ComputeDiscovery({ role }: { role: AppRole }) {
           .get("/nodes", { params: { page, page_size: pageSize, search:term||undefined, discovery_status:discoveryStatus||undefined } })
           .then((r) => r.data),
     }),
-    [selected, setSelected] = useState<Set<number>>(new Set()), [notice, setNotice] = useState(""),
+    savedViews = useQuery({ queryKey:["saved-views","compute-discovery"], queryFn:()=>api.get("/saved-views",{params:{page:"compute-discovery"}}).then(r=>r.data.items) }),
+    schedules = useQuery({ queryKey:["compute-schedules"], queryFn:()=>api.get("/scheduled-checks").then(r=>r.data.items) }),
+    alerts = useQuery({ queryKey:["scheduled-alerts"], queryFn:()=>api.get("/scheduled-checks/alerts").then(r=>r.data.items), refetchInterval:30000 }),
+    [selected, setSelected] = useState<Set<number>>(new Set()), [notice, setNotice] = useState(""), [creationError, setCreationError] = useState(""),
     [dialog, setDialog] = useState(false), [jobName, setJobName] = useState(""), [submitting, setSubmitting] = useState(false), [activeJob, setActiveJob] = useState<any>();
   const hosts: Node[] = nodes.data?.items || [],
     all = hosts.length > 0 && hosts.every((x) => selected.has(x.id)),
@@ -1813,41 +1906,46 @@ function ComputeDiscovery({ role }: { role: AppRole }) {
     });
   const run = async () => {
     const ids = [...selected];
-    if (!ids.length) return setNotice("Select at least one node.");
+    if (!ids.length) return setCreationError("Hãy chọn ít nhất một node.");
+    if (ids.length > 1800) return setCreationError(`Không thể tạo job: đã chọn ${ids.length} node, giới hạn là 1.800 node mỗi job.`);
+    setCreationError("");
     setSubmitting(true);
     try {
       const r = await api.post("/compute-discovery/jobs", { node_ids: ids, job_name: jobName || undefined });
       setActiveJob(r.data); setNotice(`Discovery job ${r.data.job_id} queued. Track progress in Running Job.`); setSelected(new Set()); setJobName(""); setDialog(false);
     } catch (e: any) {
-      setNotice(e.response?.data?.detail || "Compute discovery failed.");
+      const detail = e.response?.data?.detail;
+      const message = detail?.message || (Array.isArray(detail) ? detail.map((item:any) => item.msg).filter(Boolean).join(". ") : detail);
+      setCreationError(message || "Không thể tạo Compute Discovery job. Vui lòng thử lại hoặc kiểm tra quyền truy cập.");
     } finally {
       setSubmitting(false);
     }
   };
+  const saveView = async () => { if (!viewName.trim()) return; await api.post("/saved-views",{page:"compute-discovery",name:viewName.trim(),filters:{search,discoveryStatus,pageSize}}); setViewName(""); setSaveDialog(false); savedViews.refetch(); };
+  const applyView = (id:string) => { const view=(savedViews.data||[]).find((x:any)=>String(x.id)===id); if(!view)return; const filters=view.filters||{}; setSearch(filters.search||""); setTerm(filters.search||""); setDiscoveryStatus(filters.discoveryStatus||""); setPageSize([25,50,100,500].includes(Number(filters.pageSize))?Number(filters.pageSize):25); setPage(1); };
+  const createSchedule = async () => { const interval=Number(scheduleMinutes); if (!scheduleName.trim() || !selected.size || ![5,15,30,60,240,1440].includes(interval)) return; await api.post("/scheduled-checks",{name:scheduleName.trim(),operation:"COMPUTE_DISCOVERY",node_ids:[...selected],interval_minutes:interval}); setScheduleDialog(false); setScheduleName(""); schedules.refetch(); };
   const job = useQuery({ queryKey: ["compute-active-job", activeJob?.job_id], queryFn: () => api.get(`/compute-discovery/jobs/${activeJob.job_id}`).then(r => r.data), enabled: !!activeJob?.job_id, refetchInterval: (q) => ["QUEUED", "RUNNING"].includes(q.state.data?.status || activeJob?.status) ? 2500 : false });
   return (
     <section>
       <header>
         <h1>Compute Discovery</h1>
-        <button disabled={!selected.size || role === "VIEWER"} title={role === "VIEWER" ? "Viewer chỉ có quyền xem" : undefined} onClick={() => setDialog(true)}>
-          {`Scan Selected (${selected.size})`}
-        </button>
+        <div className="dialog-actions"><button disabled={!selected.size || role === "VIEWER"} title={role === "VIEWER" ? "Viewer chỉ có quyền xem" : undefined} onClick={() => { setCreationError(""); setDialog(true); }}>{`Quét đã chọn (${selected.size})`}</button><button className="secondary" disabled={!selected.size || role === "VIEWER"} onClick={() => setScheduleDialog(true)}>Lập lịch</button></div>
       </header>
       <p className="notice">
-        Select nodes first. Discovery is read-only and captures LLDP for up to
-        60 seconds per host.
+        Chọn node trước. Discovery chỉ đọc và thu thập LLDP tối đa 60 giây cho
+        mỗi host.
       </p>
       {notice && <p className="notice">{notice}</p>}
       {activeJob && <div className="progress"><strong>{job.data?.job_name || activeJob.job_name || "Compute Discovery"}</strong> <Badge status={job.data?.status || activeJob.status} /> <progress value={job.data?.progress_percent || 0} max="100" /> {job.data?.completed_nodes || 0}/{job.data?.total_nodes || activeJob.total_nodes} completed</div>}
       <div className="selection-bar">
-        <span>{selected.size} nodes selected</span>
+        <span>Đã chọn {selected.size} node</span>
         <button className="secondary" onClick={() => setSelected(new Set())}>
-          Clear Selection
+          Bỏ chọn
         </button>
       </div>
-      <div className="toolbar"><input placeholder="Search node, IP, labels, system or compute…" value={search} onChange={e=>setSearch(e.target.value)}/><select value={discoveryStatus} onChange={e=>{setDiscoveryStatus(e.target.value);setPage(1)}}><option value="">All Discovery Status</option><option>DETECTED</option><option>NOT_DETECTED</option><option>UNREACHABLE</option><option>ERROR</option><option>NOT_SCANNED</option></select></div>
+      <div className="toolbar"><input aria-label="Tìm node discovery" placeholder="Tìm node, IP, nhãn, system hoặc compute…" value={search} onChange={e=>setSearch(e.target.value)}/><select aria-label="Lọc trạng thái discovery" value={discoveryStatus} onChange={e=>{setDiscoveryStatus(e.target.value);setPage(1)}}><option value="">Tất cả trạng thái discovery</option><option>DETECTED</option><option>NOT_DETECTED</option><option>UNREACHABLE</option><option>ERROR</option><option>NOT_SCANNED</option></select><select aria-label="Số dòng mỗi trang" value={pageSize} onChange={e=>{setPageSize(Number(e.target.value));setPage(1)}}>{[25,50,100,500].map(value=><option key={value} value={value}>{value} dòng/trang</option>)}</select><select aria-label="Saved view" defaultValue="" onChange={e=>applyView(e.target.value)}><option value="">Saved views…</option>{(savedViews.data||[]).map((view:any)=><option key={view.id} value={view.id}>{view.name}</option>)}</select><button className="secondary" onClick={()=>setSaveDialog(true)}>Lưu view</button></div>
       {nodes.isLoading ? (
-        <p>Loading nodes…</p>
+        <p>Đang tải node…</p>
       ) : (
         <>
           <table>
@@ -1895,33 +1993,38 @@ function ComputeDiscovery({ role }: { role: AppRole }) {
               disabled={page === 1}
               onClick={() => setPage(page - 1)}
             >
-              Previous
+              Trước
             </button>
             <span>
-              Page {page} / {pages}
+              Trang {page} / {pages}
             </span>
             <button
               className="secondary"
               disabled={page >= pages}
               onClick={() => setPage(page + 1)}
             >
-              Next
+              Sau
             </button>
           </div>
         </>
       )}
-      {dialog && <div className="modal"><div className="modal-card"><h3>Start Compute Discovery</h3><label>Job Name (optional)<input autoFocus maxLength={150} value={jobName} onChange={e => setJobName(e.target.value)} /></label><p>Selected nodes: {selected.size}. The scan runs in the background and does not keep this page waiting.</p><button className="secondary" disabled={submitting} onClick={() => setDialog(false)}>Cancel</button> <button disabled={submitting} onClick={run}>{submitting ? "Starting…" : "Start Discovery"}</button></div></div>}
+      {dialog && <Dialog title="Bắt đầu Compute Discovery" onClose={() => !submitting && setDialog(false)}><label>Tên job (không bắt buộc)<input autoFocus maxLength={150} value={jobName} onChange={e => setJobName(e.target.value)} /></label><p>Đã chọn {selected.size} node. Tối đa 20 node chạy đồng thời; các đợt còn lại sẽ chờ lần lượt.</p>{creationError && <p className="error" role="alert">{creationError}</p>}<div className="dialog-actions"><button className="secondary" disabled={submitting} onClick={() => setDialog(false)}>Hủy</button><button disabled={submitting} onClick={run}>{submitting ? "Đang khởi tạo…" : "Bắt đầu discovery"}</button></div></Dialog>}
+      {saveDialog && <Dialog title="Lưu Saved View" onClose={()=>setSaveDialog(false)}><label>Tên view<input autoFocus maxLength={100} value={viewName} onChange={e=>setViewName(e.target.value)} /></label><div className="dialog-actions"><button className="secondary" onClick={()=>setSaveDialog(false)}>Hủy</button><button disabled={!viewName.trim()} onClick={saveView}>Lưu</button></div></Dialog>}
+      {scheduleDialog && <Dialog title="Lập lịch Compute Discovery" onClose={()=>setScheduleDialog(false)}><label>Tên lịch<input autoFocus maxLength={150} value={scheduleName} onChange={e=>setScheduleName(e.target.value)} /></label><label>Chu kỳ<select value={scheduleMinutes} onChange={e=>setScheduleMinutes(e.target.value)}>{[[5,"5 phút"],[15,"15 phút"],[30,"30 phút"],[60,"1 giờ"],[240,"4 giờ"],[1440,"Hằng ngày"]].map(([value,label])=><option key={String(value)} value={String(value)}>{label}</option>)}</select></label><p>Đã chọn {selected.size} node. Lịch chỉ chạy khi application session còn active.</p><div className="dialog-actions"><button className="secondary" onClick={()=>setScheduleDialog(false)}>Hủy</button><button disabled={!scheduleName.trim()} onClick={createSchedule}>Tạo lịch</button></div></Dialog>}
+      {(alerts.data||[]).length>0 && <div className="notice" role="alert">Cảnh báo lịch định kỳ: {(alerts.data||[]).map((x:any)=>x.message).join(" ")}</div>}
+      {(schedules.data||[]).filter((x:any)=>x.operation==="COMPUTE_DISCOVERY").length>0 && <p className="notice">Lịch định kỳ: {(schedules.data||[]).filter((x:any)=>x.operation==="COMPUTE_DISCOVERY").map((x:any)=>`${x.name} (${x.interval_minutes} phút)`).join(", ")}</p>}
     </section>
   );
 }
 function DiscoveryReport() {
-  const [view, setView] = useState<"groups" | "nodes" | "history">("groups"), [search, setSearch] = useState(""), [status, setStatus] = useState(""), [jobId, setJobId] = useState(""), [page, setPage] = useState(1), [selected, setSelected] = useState<Set<number>>(new Set()), [group, setGroup] = useState<any>();
+  const [view, setView] = useState<"groups" | "nodes" | "history" | "changes">("groups"), [search, setSearch] = useState(""), [status, setStatus] = useState(""), [jobId, setJobId] = useState(""), [page, setPage] = useState(1), [selected, setSelected] = useState<Set<number>>(new Set()), [group, setGroup] = useState<any>(), [exportNotice,setExportNotice]=useState("");
   const summary = useQuery({ queryKey: ["discovery-summary"], queryFn: () => api.get("/compute-discovery/report").then(r => r.data) });
   const jobs = useQuery({ queryKey: ["discovery-filter-jobs"], queryFn: () => api.get("/compute-discovery/jobs").then(r => r.data.items) });
   const data = useQuery({ queryKey: ["discovery-report", view, search, status, jobId, page], queryFn: () => api.get(`/compute-discovery/report/${view}`, { params: { page, page_size: 50, search: search || undefined, status: status || undefined, job_id: jobId || undefined } }).then(r => r.data) });
+  const exports = useQuery({ queryKey:["background-exports"], queryFn:()=>api.get("/exports").then(r=>r.data.items), refetchInterval: q=>(q.state.data||[]).some((x:any)=>["QUEUED","RUNNING"].includes(x.status))?2000:false });
   const rows = data.data?.items || [];
-  const exportRows = () => { const p = new URLSearchParams(); if(search)p.set("search",search); if(status)p.set("status",status); if(jobId)p.set("job_id",jobId); [...selected].forEach(id => p.append("node_ids",String(id))); download(`/compute-discovery/export?${p}`); };
-  const switchView = (next: "groups" | "nodes" | "history") => { setView(next); setPage(1); setSelected(new Set()); };
+  const exportRows = async () => { const result=await api.post("/exports",{export_type:"COMPUTE_DISCOVERY",payload:{search:search||undefined,status:status||undefined,job_id:jobId||undefined,node_ids:selected.size?[...selected]:undefined}}); setExportNotice(`Đã tạo export nền ${result.data.id}. File sẽ sẵn sàng trong Jobs xuất.`); exports.refetch(); };
+  const switchView = (next: "groups" | "nodes" | "history" | "changes") => { setView(next); setPage(1); setSelected(new Set()); };
   return (
     <section>
       <header>
@@ -1929,116 +2032,125 @@ function DiscoveryReport() {
         <button onClick={exportRows}>Export {selected.size ? "Selected" : "Current Filter"}</button>
       </header>
       <div className="cards"><Card title="Total Nodes Scanned" value={summary.data?.total_nodes_scanned}/><Card title="Compute Found" value={summary.data?.compute_found}/><Card title="Unique Computes" value={summary.data?.unique_computes}/><Card title="No LLDP / Unknown" value={summary.data?.no_lldp}/><Card title="Error" value={summary.data?.error}/></div>
-      <div className="toolbar"><button className={view === "groups" ? "active" : "secondary"} onClick={() => switchView("groups")}>Compute Groups</button><button className={view === "nodes" ? "active" : "secondary"} onClick={() => switchView("nodes")}>Nodes</button><button className={view === "history" ? "active" : "secondary"} onClick={() => switchView("history")}>History</button><input placeholder="Compute, hostname, IP, labels or job" value={search} onChange={e => {setSearch(e.target.value);setPage(1)}}/><select value={status} onChange={e => {setStatus(e.target.value);setPage(1)}}><option value="">All statuses</option><option>SUCCESS</option><option>NO_LLDP</option><option>UNREACHABLE</option><option>ERROR</option></select><select value={jobId} onChange={e => {setJobId(e.target.value);setPage(1)}}><option value="">All jobs</option>{(jobs.data || []).map((x:any) => <option key={x.job_id} value={x.job_id}>{x.job_name}</option>)}</select></div>
+      <div className="toolbar"><button className={view === "groups" ? "active" : "secondary"} onClick={() => switchView("groups")}>Compute Groups</button><button className={view === "nodes" ? "active" : "secondary"} onClick={() => switchView("nodes")}>Nodes</button><button className={view === "history" ? "active" : "secondary"} onClick={() => switchView("history")}>History</button><button className={view === "changes" ? "active" : "secondary"} onClick={() => switchView("changes")}>Thay đổi</button><input aria-label="Tìm báo cáo discovery" placeholder="Compute, hostname, IP, labels or job" value={search} onChange={e => {setSearch(e.target.value);setPage(1)}}/><select aria-label="Lọc trạng thái" value={status} onChange={e => {setStatus(e.target.value);setPage(1)}}><option value="">All statuses</option><option>SUCCESS</option><option>NO_LLDP</option><option>UNREACHABLE</option><option>ERROR</option></select><select aria-label="Lọc job" value={jobId} onChange={e => {setJobId(e.target.value);setPage(1)}}><option value="">All jobs</option>{(jobs.data || []).map((x:any) => <option key={x.job_id} value={x.job_id}>{x.job_name}</option>)}</select></div>
+      {exportNotice && <p className="notice">{exportNotice}</p>}
+      {(exports.data||[]).filter((x:any)=>x.export_type==="COMPUTE_DISCOVERY").slice(0,3).map((x:any)=><p className="notice" key={x.id}>Export {x.id.slice(0,8)}: <Badge status={x.status}/>{x.status==="COMPLETED" && <button className="secondary" onClick={()=>download(`/exports/${x.id}/download`)}>Tải file</button>}</p>)}
       {group && <div className="progress"><header><h2>{group.compute}</h2><button className="secondary" onClick={() => setGroup(undefined)}>Close</button></header><table><thead><tr><th>Node Name</th><th>IP</th><th>Labels</th><th>Discovery Job</th><th>LLDP NIC</th><th>Scanned At</th><th>Status</th></tr></thead><tbody>{group.nodes.map((x:any) => <tr key={x.node_id}><td>{x.hostname}</td><td>{x.address || "—"}</td><td><Labels labels={x.labels}/></td><td>{x.job_name}</td><td>{x.nic || "—"}</td><td>{time(x.discovered_at)}</td><td><Badge status={x.status}/></td></tr>)}</tbody></table></div>}
-      {data.isLoading ? <p>Loading discovery report…</p> : view === "groups" ? <table><thead><tr><th>Compute</th><th>Nodes</th><th>Status</th><th>Last Scan</th><th>Action</th></tr></thead><tbody>{rows.map((x:any) => <tr key={x.compute}><td>{x.compute}</td><td>{x.node_count} — {x.node_names.join(", ")}</td><td><Badge status={x.status}/></td><td>{time(x.last_scan)}</td><td><button className="secondary" onClick={() => setGroup(x)}>View</button></td></tr>)}</tbody></table> : <table><thead><tr><th><input type="checkbox" checked={rows.length > 0 && rows.every((x:any) => selected.has(x.node_id))} onChange={() => setSelected(rows.length && rows.every((x:any) => selected.has(x.node_id)) ? new Set() : new Set(rows.map((x:any) => x.node_id)))}/></th>{view === "history" && <th>Job ID</th>}<th>Node Name</th><th>IP</th><th>Compute</th><th>NIC</th><th>Status</th><th>Job</th><th>Scanned At</th><th>Error</th></tr></thead><tbody>{rows.map((x:any) => <tr key={`${x.node_id}-${x.discovered_at}`}><td><input type="checkbox" checked={selected.has(x.node_id)} onChange={() => setSelected(old => {const next=new Set(old);next.has(x.node_id)?next.delete(x.node_id):next.add(x.node_id);return next})}/></td>{view === "history" && <td>{x.job_id}</td>}<td>{x.hostname}</td><td>{x.address || "—"}</td><td>{x.compute || "—"}</td><td>{x.nic || "—"}</td><td><Badge status={x.status}/></td><td>{x.job_name}</td><td>{time(x.discovered_at)}</td><td>{x.detail || "—"}</td></tr>)}</tbody></table>}
+      {data.isLoading ? <p>Loading discovery report…</p> : view === "groups" ? <table><thead><tr><th>Compute</th><th>Nodes</th><th>Status</th><th>Last Scan</th><th>Action</th></tr></thead><tbody>{rows.map((x:any) => <tr key={x.compute}><td>{x.compute}</td><td>{x.node_count} — {x.node_names.join(", ")}</td><td><Badge status={x.status}/></td><td>{time(x.last_scan)}</td><td><button className="secondary" onClick={() => setGroup(x)}>View</button></td></tr>)}</tbody></table> : <table><thead><tr><th><input aria-label="Chọn tất cả node" type="checkbox" checked={rows.length > 0 && rows.every((x:any) => selected.has(x.node_id))} onChange={() => setSelected(rows.length && rows.every((x:any) => selected.has(x.node_id)) ? new Set() : new Set(rows.map((x:any) => x.node_id)))}/></th>{view === "history" && <th>Job ID</th>}{view === "changes" && <th>Thay đổi</th>}<th>Node Name</th><th>IP</th><th>Compute</th><th>NIC</th><th>Status</th><th>Job</th><th>Scanned At</th><th>Error</th></tr></thead><tbody>{rows.map((x:any) => <tr key={`${x.node_id}-${x.discovered_at}`}><td><input aria-label={`Chọn ${x.hostname}`} type="checkbox" checked={selected.has(x.node_id)} onChange={() => setSelected(old => {const next=new Set(old);next.has(x.node_id)?next.delete(x.node_id):next.add(x.node_id);return next})}/></td>{view === "history" && <td>{x.job_id}</td>}{view === "changes" && <td>{x.change_type}{x.previous_compute ? `: ${x.previous_compute} → ${x.compute || "—"}` : ""}</td>}<td>{x.hostname}</td><td>{x.address || "—"}</td><td>{x.compute || "—"}</td><td>{x.nic || "—"}</td><td><Badge status={x.status}/></td><td>{x.job_name}</td><td>{time(x.discovered_at)}</td><td>{x.detail || "—"}</td></tr>)}</tbody></table>}
       <div className="pagination"><button className="secondary" disabled={page === 1} onClick={() => setPage(page - 1)}>Previous</button><span>Page {page}</span><button className="secondary" disabled={page * 50 >= (data.data?.total || 0)} onClick={() => setPage(page + 1)}>Next</button></div>
     </section>
   );
 }
+type Page =
+  | "overview"
+  | "nodes"
+  | "process-scan"
+  | "compute-discovery"
+  | "service-configuration"
+  | "jobs"
+  | "reports"
+  | "config-report"
+  | "discovery-report"
+  | "help";
+
+const pagePaths: Record<Page, string> = {
+  overview: "/overview",
+  nodes: "/nodes",
+  "process-scan": "/process-scan",
+  "compute-discovery": "/compute-discovery",
+  "service-configuration": "/service-configuration",
+  jobs: "/jobs",
+  reports: "/reports",
+  "config-report": "/reports/service-configuration",
+  "discovery-report": "/reports/compute-discovery",
+  help: "/help",
+};
+const pageFromPath = (path: string): Page =>
+  (Object.entries(pagePaths).find(([, value]) => value === path)?.[0] as Page) || "overview";
+
+function Overview({ navigate }: { navigate: (page: Page) => void }) {
+  const nodes = useQuery({ queryKey: ["overview-nodes"], queryFn: () => api.get("/nodes", { params: { page: 1, page_size: 1 } }).then((r) => r.data) });
+  const scans = useQuery({ queryKey: ["overview-scans"], queryFn: () => api.get("/reports/summary").then((r) => r.data) });
+  const discovery = useQuery({ queryKey: ["overview-discovery"], queryFn: () => api.get("/compute-discovery/report").then((r) => r.data) });
+  return <section>
+    <header><div><h1>Tổng quan</h1><p className="page-intro">Theo dõi nhanh node, kết quả quét tiến trình và Compute Discovery.</p></div></header>
+    <div className="cards overview-cards">
+      <Card title="Tổng số node" value={nodes.data?.total ?? "—"} />
+      <Card title="Node có cảnh báo" value={scans.data?.warning ?? scans.data?.warning_nodes ?? "—"} />
+      <Card title="Compute đã phát hiện" value={discovery.data?.compute_found ?? "—"} />
+      <Card title="Lỗi discovery" value={discovery.data?.error ?? "—"} />
+    </div>
+    <div className="overview-actions" aria-label="Lối tắt vận hành">
+      <button onClick={() => navigate("nodes")}>Xem node</button>
+      <button onClick={() => navigate("process-scan")}>Quét tiến trình</button>
+      <button onClick={() => navigate("compute-discovery")}>Compute Discovery</button>
+      <button className="secondary" onClick={() => navigate("jobs")}>Theo dõi jobs</button>
+    </div>
+  </section>;
+}
+
+function Reports({ page, navigate, initialHost, onBack }: { page: Page; navigate: (page: Page) => void; initialHost?: number; onBack: () => void }) {
+  return <section className="reports-page">
+    <nav className="report-nav" aria-label="Các loại báo cáo">
+      <button className={page === "reports" ? "active" : "secondary"} aria-current={page === "reports" ? "page" : undefined} onClick={() => navigate("reports")}>Quét tiến trình</button>
+      <button className={page === "config-report" ? "active" : "secondary"} aria-current={page === "config-report" ? "page" : undefined} onClick={() => navigate("config-report")}>Cấu hình dịch vụ</button>
+      <button className={page === "discovery-report" ? "active" : "secondary"} aria-current={page === "discovery-report" ? "page" : undefined} onClick={() => navigate("discovery-report")}>Compute Discovery</button>
+    </nav>
+    {page === "config-report" ? <ConfigReport /> : page === "discovery-report" ? <DiscoveryReport /> : <ReportUI initialHost={initialHost} onBack={onBack} />}
+  </section>;
+}
+
 function App() {
   const [logged, setLogged] = useState(false), [authLoading,setAuthLoading]=useState(true), [role,setRole]=useState<AppRole>("VIEWER"),
-    [tab, setTab] = useState<
-      | "Nodes"
-      | "Jobs"
-      | "Compute"
-      | "Criteria"
-      | "ServiceConfig"
-      | "Report"
-      | "ConfigReport"
-      | "DiscoveryReport"
-    >(() =>
-      window.location.pathname === "/compute-discovery" ? "Compute" : "Nodes",
-    ),
+    [page, setPage] = useState<Page>(() => pageFromPath(window.location.pathname)),
     [reportHost, setReportHost] = useState<number>();
+  const navigate = (next: Page, replace = false) => {
+    const method = replace ? "replaceState" : "pushState";
+    history[method](null, "", pagePaths[next]);
+    setPage(next);
+    window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
+  };
+  useEffect(() => {
+    if (window.location.pathname === "/") history.replaceState(null, "", pagePaths.overview);
+    const onPopState = () => setPage(pageFromPath(window.location.pathname));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
   useEffect(()=>{let mounted=true;const session=localStorage.getItem("teleport_session");if(!session){setAuthLoading(false);return}api.get("/auth/status").then((r)=>{if(mounted){setRole((r.data.role || "VIEWER") as AppRole);setLogged(true)}}).catch(()=>localStorage.removeItem("teleport_session")).finally(()=>{if(mounted)setAuthLoading(false)});return()=>{mounted=false}},[]);
   if(authLoading)return <main className="login"><p>Đang xác minh phiên đăng nhập…</p></main>;
   if (!logged) return <Login ok={(nextRole) => { setRole(nextRole); setLogged(true); }} />;
-  const open = (id: number) => {
-    setReportHost(id);
-    setTab("Report");
-  };
-  return (
-    <div className="shell">
-      <aside>
-        <h2>Teleport</h2>
-        {(
-          [
-            "Nodes",
-            "Jobs",
-            "Compute",
-            "ServiceConfig",
-            "Criteria",
-            "Report",
-            "ConfigReport",
-            "DiscoveryReport",
-          ] as const
-        ).map((x) => (
-          <button
-            key={x}
-            className={tab === x ? "active" : ""}
-            onClick={() => {
-              setTab(x);
-              history.replaceState(
-                null,
-                "",
-                x === "Compute" ? "/compute-discovery" : "/",
-              );
-              if (x === "Report") setReportHost(undefined);
-            }}
-          >
-            {x === "Jobs"
-              ? "Running Job"
-              : x === "Compute"
-                ? "Compute Discovery"
-                : x === "Criteria"
-                  ? "Nguyên tắc scan"
-                  : x === "ServiceConfig"
-                    ? "Service Config"
-                    : x === "ConfigReport"
-                      ? "Report: Teleport Kill Mode"
-                      : x === "DiscoveryReport"
-                        ? "Report: Discovery Compute"
-                        : x}
-          </button>
-        ))}
-        <button
-          onClick={async () => {
-            try {
-              await api.post("/auth/logout");
-            } finally {
-              localStorage.removeItem("teleport_session");
-              setLogged(false);
-            }
-          }}
-        >
-          Logout
-        </button>
-      </aside>
-      <main>
-        {tab === "Nodes" ? (
-          <Nodes openReport={open} role={role} />
-        ) : tab === "Jobs" ? (
-          <Jobs />
-        ) : tab === "Compute" ? (
-          <ComputeDiscovery role={role} />
-        ) : tab === "Criteria" ? (
-          <Criteria />
-        ) : tab === "ServiceConfig" ? (
-          <ServiceConfig role={role} />
-        ) : tab === "ConfigReport" ? (
-          <ConfigReport />
-        ) : tab === "DiscoveryReport" ? (
-          <DiscoveryReport />
-        ) : (
-          <ReportUI
-            initialHost={reportHost}
-            onBack={() => setReportHost(undefined)}
-          />
-        )}
-      </main>
-    </div>
-  );
+  const openReport = (id: number) => { setReportHost(id); navigate("reports"); };
+  const menu: Array<{ page: Page; label: string }> = [
+    { page: "overview", label: "Tổng quan" },
+    { page: "nodes", label: "Nodes" },
+    { page: "process-scan", label: "Quét tiến trình" },
+    { page: "compute-discovery", label: "Compute Discovery" },
+    { page: "service-configuration", label: "Cấu hình dịch vụ" },
+    { page: "jobs", label: "Jobs" },
+    { page: "reports", label: "Báo cáo" },
+    { page: "help", label: "Trợ giúp" },
+  ];
+  const menuPage = ["config-report", "discovery-report"].includes(page) ? "reports" : page;
+  return <div className="shell">
+    <a className="skip-link" href="#main-content">Bỏ qua điều hướng</a>
+    <aside>
+      <h2>Teleport Scanner</h2>
+      <nav aria-label="Điều hướng chính">
+        {menu.map((item) => <button key={item.page} className={menuPage === item.page ? "active" : ""} aria-current={menuPage === item.page ? "page" : undefined} onClick={() => { setReportHost(undefined); navigate(item.page); }}>{item.label}</button>)}
+      </nav>
+      <button className="logout" onClick={async () => { try { await api.post("/auth/logout"); } finally { localStorage.removeItem("teleport_session"); setLogged(false); } }}>Đăng xuất</button>
+    </aside>
+    <main id="main-content" tabIndex={-1}>
+      {page === "overview" ? <Overview navigate={navigate} />
+        : page === "nodes" ? <Nodes openReport={openReport} role={role} />
+        : page === "process-scan" ? <Nodes openReport={openReport} role={role} scanMode />
+        : page === "compute-discovery" ? <ComputeDiscovery role={role} />
+        : page === "service-configuration" ? <ServiceConfig role={role} />
+        : page === "jobs" ? <Jobs />
+        : page === "help" ? <Criteria />
+        : <Reports page={page} navigate={navigate} initialHost={reportHost} onBack={() => setReportHost(undefined)} />}
+    </main>
+  </div>;
 }
 createRoot(document.getElementById("root")!).render(
   <QueryClientProvider client={new QueryClient()}>

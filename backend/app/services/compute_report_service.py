@@ -18,10 +18,14 @@ def _clean_cell(value):
     return "'"+text if text.startswith(('=','+','-','@')) else text
 
 
-def _latest_stmt(session_id):
+def _scope_ids(session_ids):
+    return [session_ids] if isinstance(session_ids,str) else list(session_ids)
+
+def _latest_stmt(session_ids):
+    scope=_scope_ids(session_ids)
     latest_ids=(select(func.max(ComputeDiscoveryResult.id).label('id'))
-        .where(ComputeDiscoveryResult.session_id==session_id)
-        .group_by(ComputeDiscoveryResult.node_id).subquery())
+        .where(ComputeDiscoveryResult.session_id.in_(scope))
+        .group_by(ComputeDiscoveryResult.hostname).subquery())
     return (select(ComputeDiscoveryResult, ComputeDiscoveryJob, Node)
         .join(ComputeDiscoveryJob,ComputeDiscoveryJob.id==ComputeDiscoveryResult.job_id)
         .outerjoin(Node,Node.id==ComputeDiscoveryResult.node_id)
@@ -43,8 +47,8 @@ def _row(result, job, node):
         'job_id':result.job_id,'job_name':job.job_name,'job_status':job.status}
 
 
-def _latest_rows(db, session_id, search=None, status=None, job_id=None):
-    return [_row(*item) for item in db.execute(_filtered(_latest_stmt(session_id),search,status,job_id).order_by(ComputeDiscoveryResult.hostname)).all()]
+def _latest_rows(db, session_ids, search=None, status=None, job_id=None):
+    return [_row(*item) for item in db.execute(_filtered(_latest_stmt(session_ids),search,status,job_id).order_by(ComputeDiscoveryResult.hostname)).all()]
 
 
 def _page(items, page, page_size):
@@ -52,8 +56,8 @@ def _page(items, page, page_size):
     return {'items':items[start:start+page_size],'total':total,'page':page,'page_size':page_size}
 
 
-def summary(db, session_id):
-    rows=_latest_rows(db,session_id)
+def summary(db, session_ids):
+    rows=_latest_rows(db,session_ids)
     detected=sum(x['status'] in ('DETECTED','SUCCESS') for x in rows); not_detected=sum(x['status'] in ('NOT_DETECTED','NO_LLDP') for x in rows)
     distribution={'DETECTED':detected,'NOT_DETECTED':not_detected,'UNREACHABLE':sum(x['status']=='UNREACHABLE' for x in rows),'ERROR':sum(x['status']=='ERROR' for x in rows)}
     reasons=defaultdict(int)
@@ -65,9 +69,9 @@ def summary(db, session_id):
         'items':rows}
 
 
-def groups(db, session_id, page, page_size, search=None, status=None, job_id=None):
+def groups(db, session_ids, page, page_size, search=None, status=None, job_id=None):
     bucket=defaultdict(list)
-    for row in _latest_rows(db,session_id,search,status,job_id):
+    for row in _latest_rows(db,session_ids,search,status,job_id):
         key=row['compute'] if row['status'] in ('DETECTED','SUCCESS') and row['compute'] else ('NOT_DETECTED' if row['status'] in ('NOT_DETECTED','NO_LLDP') else row['status'])
         bucket[key].append(row)
     result=[]
@@ -80,24 +84,48 @@ def groups(db, session_id, page, page_size, search=None, status=None, job_id=Non
     return _page(result,page,page_size)
 
 
-def nodes(db, session_id, page, page_size, search=None, status=None, job_id=None):
-    return _page(_latest_rows(db,session_id,search,status,job_id),page,page_size)
+def nodes(db, session_ids, page, page_size, search=None, status=None, job_id=None):
+    return _page(_latest_rows(db,session_ids,search,status,job_id),page,page_size)
 
 
-def history(db, session_id, page, page_size, search=None, status=None, job_id=None):
+def history(db, session_ids, page, page_size, search=None, status=None, job_id=None):
     stmt=(select(ComputeDiscoveryResult,ComputeDiscoveryJob,Node)
         .join(ComputeDiscoveryJob,ComputeDiscoveryJob.id==ComputeDiscoveryResult.job_id)
         .outerjoin(Node,Node.id==ComputeDiscoveryResult.node_id)
-        .where(ComputeDiscoveryResult.session_id==session_id))
+        .where(ComputeDiscoveryResult.session_id.in_(_scope_ids(session_ids))))
     rows=[_row(*item) for item in db.execute(_filtered(stmt,search,status,job_id).order_by(ComputeDiscoveryResult.discovered_at.desc(),ComputeDiscoveryResult.id.desc())).all()]
     return _page(rows,page,page_size)
 
 
-def job_results(db, session_id, job_id):
+def changes(db, session_ids, page, page_size, search=None):
+    """Compare each node's two most recent discovery observations."""
+    rows=history(db,session_ids,1,100000,search=search)['items']
+    by_node=defaultdict(list)
+    for row in rows: by_node[row['hostname']].append(row)
+    result=[]
+    for node_id, values in by_node.items():
+        current=values[0]
+        previous=values[1] if len(values)>1 else None
+        if not previous:
+            change='NEW'
+        elif current['status'] != previous['status']:
+            change='STATUS_CHANGED'
+        elif (current['compute'] or '') != (previous['compute'] or ''):
+            change='COMPUTE_CHANGED'
+        else:
+            change='UNCHANGED'
+        result.append({**current,'previous_compute':previous['compute'] if previous else None,
+            'previous_status':previous['status'] if previous else None,
+            'previous_discovered_at':previous['discovered_at'] if previous else None,'change_type':change})
+    result.sort(key=lambda value:(value['change_type']=='UNCHANGED',value['hostname']))
+    return _page(result,page,page_size)
+
+
+def job_results(db, session_ids, job_id):
     stmt=(select(ComputeDiscoveryResult,ComputeDiscoveryJob,Node)
         .join(ComputeDiscoveryJob,ComputeDiscoveryJob.id==ComputeDiscoveryResult.job_id)
         .outerjoin(Node,Node.id==ComputeDiscoveryResult.node_id)
-        .where(ComputeDiscoveryResult.session_id==session_id,ComputeDiscoveryResult.job_id==job_id)
+        .where(ComputeDiscoveryResult.session_id.in_(_scope_ids(session_ids)),ComputeDiscoveryResult.job_id==job_id)
         .order_by(ComputeDiscoveryResult.discovered_at.desc()))
     return [_row(*item) for item in db.execute(stmt).all()]
 
@@ -112,13 +140,14 @@ def _sheet(book, name, headers, rows):
     return ws
 
 
-def export_discovery(db, session, search=None, status=None, job_id=None, node_ids=None):
-    latest=_latest_rows(db,session.id,search,status,job_id)
+def export_discovery(db, session, search=None, status=None, job_id=None, node_ids=None, session_ids=None):
+    scope=_scope_ids(session_ids or [session.id])
+    latest=_latest_rows(db,scope,search,status,job_id)
     if node_ids is not None: latest=[x for x in latest if x['node_id'] in set(node_ids)]
-    group_rows=groups(db,session.id,1,100000,search,status,job_id)['items']
-    history_rows=history(db,session.id,1,100000,search,status,job_id)['items']
+    group_rows=groups(db,scope,1,100000,search,status,job_id)['items']
+    history_rows=history(db,scope,1,100000,search,status,job_id)['items']
     if node_ids is not None: history_rows=[x for x in history_rows if x['node_id'] in set(node_ids)]
-    jobs=db.scalars(select(ComputeDiscoveryJob).where(ComputeDiscoveryJob.session_id==session.id).order_by(ComputeDiscoveryJob.created_at.desc())).all()
+    jobs=db.scalars(select(ComputeDiscoveryJob).where(ComputeDiscoveryJob.session_id.in_(scope)).order_by(ComputeDiscoveryJob.created_at.desc())).all()
     book=Workbook(); book.remove(book.active)
     overview=_sheet(book,'01_Overview',['Metric','Value'],[
         ('Generated At',datetime.utcnow().isoformat()),('Generated By',session.username),('Session / Cluster',session.cluster or ''),('Filter Summary',f'search={search or ""}; status={status or ""}; job={job_id or ""}'),

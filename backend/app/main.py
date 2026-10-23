@@ -2,7 +2,7 @@ import logging, threading, uuid
 from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from fastapi import FastAPI, Depends, Header, HTTPException, BackgroundTasks, Query, Request
@@ -10,11 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
-from sqlalchemy import String, and_, cast, func, or_, select, update, delete
+from sqlalchemy import String, and_, cast, func, or_, select, update, delete, text
 from sqlalchemy.orm import Session as Db
 from .config import settings
 from .database import Base, engine, db_session, SessionLocal
-from .models import Session,Node,ScanJob,ScanResult,ServiceConfigJob,ServiceConfigResult,ComputeDiscoveryJob,ComputeDiscoveryResult,AuditLog
+from .models import Session,Node,ScanJob,ScanResult,ServiceConfigJob,ServiceConfigResult,ComputeDiscoveryJob,ComputeDiscoveryResult,AuditLog,SavedView,ExportJob,ScheduledCheck
 from .schemas.api import LoginRequest,ScanRequest,ComputeDiscoveryRequest,ServiceConfigRequest,ReportExportRequest,ReportRemoveRequest
 from .services import teleport
 from .services.session_manager import new_id,path,expiry,remove
@@ -43,10 +43,13 @@ async def lifespan(app):
         stale_service=db.scalars(select(ServiceConfigJob).where(ServiceConfigJob.status.in_(['QUEUED','RUNNING']))).all()
         for job in stale_service:
             job.status='FAILED'; job.finished_at=datetime.utcnow()
-        if stale or stale_scans or stale_service:
+        stale_exports=db.scalars(select(ExportJob).where(ExportJob.status.in_(['QUEUED','RUNNING']))).all()
+        for job in stale_exports:
+            job.status='FAILED'; job.error_message='INTERRUPTED_BY_BACKEND_RESTART'; job.finished_at=datetime.utcnow()
+        if stale or stale_scans or stale_service or stale_exports:
             db.commit(); log.warning('STALE_JOBS_FINALIZED discovery=%s scan=%s service=%s',len(stale),len(stale_scans),len(stale_service))
     finally: db.close()
-    scheduler=start(); yield
+    scheduler=start(); scheduler.add_job(run_scheduled_checks,'interval',minutes=1,id='scheduled-checks',replace_existing=True); yield
     scheduler.shutdown()
 app=FastAPI(title='Teleport Cgroup Scanner',lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=settings.allowed_origins.split(','),allow_credentials=False,allow_methods=['*'],allow_headers=['*'])
@@ -63,6 +66,10 @@ def active(x_session_id: str|None=Header(None,alias='X-Session-Id'), db:Db=Depen
     s=db.get(Session,x_session_id)
     if not s or s.status!='ACTIVE' or (s.expires_at and s.expires_at<datetime.utcnow()): raise HTTPException(401,'SESSION_EXPIRED')
     return s
+def report_scope_ids(db,s):
+    """Persistent report scope: one Teleport identity in one cluster across logins."""
+    cluster_filter=Session.cluster.is_(None) if s.cluster is None else Session.cluster==s.cluster
+    return list(db.scalars(select(Session.id).where(Session.username==s.username,cluster_filter)).all())
 def user_role(username):
     name=username.strip().lower()
     if name in {x.strip().lower() for x in settings.admin_users.split(',') if x.strip()}: return 'ADMIN'
@@ -117,11 +124,31 @@ def auth_status(s:Session=Depends(active)):
     try: info=teleport.status(s.id,s.tsh_version)
     except Exception: info={}
     return {'session_id':s.id,'username':s.username,'role':s.role,'proxy':s.proxy,'tsh_version':s.tsh_version,'cluster':info.get('Cluster',s.cluster),'valid_until':info.get('Valid until',s.expires_at),'roles':info.get('Roles'),'status':'ACTIVE'}
+@app.get('/saved-views')
+def saved_views(page:str=Query(...,max_length=64),s:Session=Depends(active),db:Db=Depends(db_session)):
+    return {'items':[{'id':v.id,'name':v.name,'page':v.page,'filters':v.filters,'created_at':v.created_at,'updated_at':v.updated_at} for v in db.scalars(select(SavedView).where(SavedView.username==s.username,SavedView.page==page).order_by(SavedView.name)).all()]}
+@app.post('/saved-views')
+def save_view(body:dict,s:Session=Depends(active),db:Db=Depends(db_session)):
+    page=str(body.get('page','')).strip(); name=str(body.get('name','')).strip(); filters=body.get('filters')
+    if page not in {'nodes','process-scan','compute-discovery','reports','config-report','discovery-report'}: raise HTTPException(422,'INVALID_SAVED_VIEW_PAGE')
+    if not name or len(name)>100 or not isinstance(filters,dict): raise HTTPException(422,'INVALID_SAVED_VIEW')
+    view=db.scalar(select(SavedView).where(SavedView.username==s.username,SavedView.page==page,SavedView.name==name))
+    now=datetime.utcnow()
+    if view: view.filters=filters; view.updated_at=now
+    else: view=SavedView(username=s.username,page=page,name=name,filters=filters,created_at=now,updated_at=now); db.add(view)
+    db.commit(); audit(db,s,'SAVED_VIEW_SAVE','SAVED_VIEW',1,details=f'page={page}; name={name}')
+    return {'id':view.id,'name':view.name,'page':view.page,'filters':view.filters,'updated_at':view.updated_at}
+@app.delete('/saved-views/{view_id}')
+def delete_view(view_id:int,s:Session=Depends(active),db:Db=Depends(db_session)):
+    view=db.get(SavedView,view_id)
+    if not view or view.username!=s.username: raise HTTPException(404,'SAVED_VIEW_NOT_FOUND')
+    db.delete(view); db.commit(); audit(db,s,'SAVED_VIEW_DELETE','SAVED_VIEW',1,details=f'id={view_id}')
+    return {'status':'DELETED'}
 @app.get('/nodes')
 def nodes(q:str='',search:str='',status:str='',discovery_status:str='',offset:int|None=None,limit:int|None=None,page:int|None=None,page_size:int|None=None,s:Session=Depends(active),db:Db=Depends(db_session)):
     """Server-side node search. q/offset/limit remain for older clients."""
     term=(search or q).strip()
-    effective_limit=min(page_size or limit or 50,200)
+    effective_limit=min(page_size or limit or 50,500)
     effective_offset=((max(page or 1,1)-1)*effective_limit) if page is not None else max(offset or 0,0)
     latest_ids=select(func.max(ComputeDiscoveryResult.id).label('id')).where(ComputeDiscoveryResult.session_id==s.id).group_by(ComputeDiscoveryResult.node_id).subquery()
     stmt=select(Node,ComputeDiscoveryResult).outerjoin(ComputeDiscoveryResult,and_(ComputeDiscoveryResult.id.in_(select(latest_ids.c.id)),ComputeDiscoveryResult.node_id==Node.id)).where(Node.session_id==s.id)
@@ -319,7 +346,13 @@ def _execute_compute_job(job_id):
 
 def create_compute_job(body,s,db):
     ids=list(dict.fromkeys(body.node_ids))
-    if len(ids)>settings.discovery_max_nodes_per_request: raise HTTPException(400,'TOO_MANY_NODES')
+    if len(ids)>settings.discovery_max_nodes_per_request:
+        raise HTTPException(400,{
+            'code':'TOO_MANY_NODES',
+            'message':f'Compute Discovery supports at most {settings.discovery_max_nodes_per_request} nodes per job.',
+            'selected_nodes':len(ids),
+            'max_nodes':settings.discovery_max_nodes_per_request,
+        })
     nodes=db.scalars(select(Node).where(Node.session_id==s.id,Node.id.in_(ids))).all()
     if len(nodes)!=len(ids): raise HTTPException(404,'NODE_NOT_FOUND')
     now=datetime.utcnow(); name=body.job_name or f'Discovery Scan - {now.strftime("%Y-%m-%d %H:%M:%S")}'
@@ -340,19 +373,32 @@ def compute_discovery_legacy(body:ComputeDiscoveryRequest,s:Session=Depends(acti
 
 @app.get('/compute-discovery/jobs')
 def compute_jobs(s:Session=Depends(active),db:Db=Depends(db_session)):
-    return {'items':[_compute_job_payload(j) for j in db.scalars(select(ComputeDiscoveryJob).where(ComputeDiscoveryJob.session_id==s.id).order_by(ComputeDiscoveryJob.created_at.desc())).all()]}
+    scope=report_scope_ids(db,s)
+    return {'items':[_compute_job_payload(j) for j in db.scalars(select(ComputeDiscoveryJob).where(ComputeDiscoveryJob.session_id.in_(scope)).order_by(ComputeDiscoveryJob.created_at.desc())).all()]}
 
 @app.get('/compute-discovery/jobs/{job_id}')
 def compute_job(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
     j=db.get(ComputeDiscoveryJob,job_id)
-    if not j or j.session_id!=s.id: raise HTTPException(404,'COMPUTE_JOB_NOT_FOUND')
-    value=_compute_job_payload(j); value['nodes']=compute_report_service.job_results(db,s.id,job_id)
+    scope=report_scope_ids(db,s)
+    if not j or j.session_id not in scope: raise HTTPException(404,'COMPUTE_JOB_NOT_FOUND')
+    value=_compute_job_payload(j); value['nodes']=compute_report_service.job_results(db,scope,job_id)
     return value
 
 @app.get('/compute-discovery/jobs/{job_id}/results')
 def compute_results(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
+    scope=report_scope_ids(db,s)
+    if not db.scalar(select(ComputeDiscoveryJob.id).where(ComputeDiscoveryJob.id==job_id,ComputeDiscoveryJob.session_id.in_(scope))): raise HTTPException(404,'COMPUTE_JOB_NOT_FOUND')
+    return {'items':compute_report_service.job_results(db,scope,job_id)}
+
+@app.post('/compute-discovery/jobs/{job_id}/retry-failed')
+def retry_compute_failed(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
+    require(s,'OPERATOR','ADMIN')
     if not db.scalar(select(ComputeDiscoveryJob.id).where(ComputeDiscoveryJob.id==job_id,ComputeDiscoveryJob.session_id==s.id)): raise HTTPException(404,'COMPUTE_JOB_NOT_FOUND')
-    return {'items':compute_report_service.job_results(db,s.id,job_id)}
+    ids=list(db.scalars(select(ComputeDiscoveryResult.node_id).where(ComputeDiscoveryResult.job_id==job_id,ComputeDiscoveryResult.status.in_(['ERROR','UNREACHABLE'])).distinct()).all())
+    if not ids: raise HTTPException(409,'NO_FAILED_NODES_TO_RETRY')
+    value=create_compute_job(SimpleNamespace(node_ids=ids,job_name=f'Retry failed discovery - {job_id[:8]}'),s,db)
+    audit(db,s,'DISCOVERY_RETRY_FAILED','NODE',len(ids),value['job_id'],details=f'source_job={job_id}')
+    return value
 
 @app.get('/compute-discovery/history')
 def compute_history(s:Session=Depends(active),db:Db=Depends(db_session)):
@@ -360,23 +406,66 @@ def compute_history(s:Session=Depends(active),db:Db=Depends(db_session)):
 
 @app.get('/compute-discovery/report')
 def compute_discovery_report(s:Session=Depends(active),db:Db=Depends(db_session)):
-    return compute_report_service.summary(db,s.id)
+    return compute_report_service.summary(db,report_scope_ids(db,s))
 
 @app.get('/compute-discovery/report/groups')
 def compute_report_groups(page:int=Query(1,ge=1),page_size:int=Query(50,ge=1,le=100),search:str|None=None,status:str|None=None,job_id:str|None=None,s:Session=Depends(active),db:Db=Depends(db_session)):
-    return compute_report_service.groups(db,s.id,page,page_size,search,status,job_id)
+    return compute_report_service.groups(db,report_scope_ids(db,s),page,page_size,search,status,job_id)
 
 @app.get('/compute-discovery/report/nodes')
 def compute_report_nodes(page:int=Query(1,ge=1),page_size:int=Query(50,ge=1,le=100),search:str|None=None,status:str|None=None,job_id:str|None=None,s:Session=Depends(active),db:Db=Depends(db_session)):
-    return compute_report_service.nodes(db,s.id,page,page_size,search,status,job_id)
+    return compute_report_service.nodes(db,report_scope_ids(db,s),page,page_size,search,status,job_id)
 
 @app.get('/compute-discovery/report/history')
 def compute_report_history(page:int=Query(1,ge=1),page_size:int=Query(50,ge=1,le=100),search:str|None=None,status:str|None=None,job_id:str|None=None,s:Session=Depends(active),db:Db=Depends(db_session)):
-    return compute_report_service.history(db,s.id,page,page_size,search,status,job_id)
+    return compute_report_service.history(db,report_scope_ids(db,s),page,page_size,search,status,job_id)
+
+@app.get('/compute-discovery/report/changes')
+def compute_report_changes(page:int=Query(1,ge=1),page_size:int=Query(50,ge=1,le=500),search:str|None=None,s:Session=Depends(active),db:Db=Depends(db_session)):
+    return compute_report_service.changes(db,report_scope_ids(db,s),page,page_size,search)
 
 @app.get('/compute-discovery/export')
 def compute_report_export(search:str|None=None,status:str|None=None,job_id:str|None=None,node_ids:list[int]|None=Query(None),s:Session=Depends(active),db:Db=Depends(db_session)):
-    output=compute_report_service.export_discovery(db,s,search,status,job_id,node_ids); audit(db,s,'REPORT_EXPORT','COMPUTE_DISCOVERY',len(node_ids or []),job_id)
+    output=compute_report_service.export_discovery(db,s,search,status,job_id,node_ids,report_scope_ids(db,s)); audit(db,s,'REPORT_EXPORT','COMPUTE_DISCOVERY',len(node_ids or []),job_id)
+    return FileResponse(output,filename=output.name,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+def _export_job_payload(job):
+    return {key:getattr(job,key) for key in ('id','export_type','status','filename','error_message','created_at','started_at','finished_at')}
+def _execute_export_job(job_id):
+    db=SessionLocal()
+    try:
+        job=db.get(ExportJob,job_id)
+        if not job or job.status!='QUEUED': return
+        job.status='RUNNING'; job.started_at=datetime.utcnow(); db.commit()
+        session=db.get(Session,job.session_id); payload=job.payload or {}
+        scope=report_scope_ids(db,session)
+        if job.export_type=='COMPUTE_DISCOVERY': output=compute_report_service.export_discovery(db,session,payload.get('search'),payload.get('status'),payload.get('job_id'),payload.get('node_ids'),scope)
+        elif job.export_type=='PROCESS_REPORT': output=report_service.export_report(db,scope,node_ids=payload.get('node_ids'),search=payload.get('search'),status=payload.get('status'))
+        else: raise RuntimeError('UNSUPPORTED_EXPORT_TYPE')
+        job.status='COMPLETED'; job.filename=output.name; job.finished_at=datetime.utcnow(); db.commit()
+        audit(db,session,'REPORT_EXPORT','BACKGROUND_EXPORT',len(payload.get('node_ids') or []),job.id,'SUCCESS',f'type={job.export_type}')
+    except Exception as exc:
+        db.rollback(); job=db.get(ExportJob,job_id)
+        if job: job.status='FAILED'; job.error_message=str(exc)[:500]; job.finished_at=datetime.utcnow(); db.commit()
+        log.exception('background_export_failed job_id=%s',job_id)
+    finally: db.close()
+@app.post('/exports')
+def create_background_export(body:dict,s:Session=Depends(active),db:Db=Depends(db_session)):
+    export_type=str(body.get('export_type','')).upper(); payload=body.get('payload') or {}
+    if export_type not in {'COMPUTE_DISCOVERY','PROCESS_REPORT'} or not isinstance(payload,dict): raise HTTPException(422,'INVALID_EXPORT_REQUEST')
+    job=ExportJob(id=str(uuid.uuid4()),session_id=s.id,created_by=s.username,export_type=export_type,payload=payload,status='QUEUED',created_at=datetime.utcnow())
+    db.add(job); db.commit(); threading.Thread(target=_execute_export_job,args=(job.id,),daemon=True).start()
+    audit(db,s,'BACKGROUND_EXPORT_CREATE','BACKGROUND_EXPORT',len(payload.get('node_ids') or []),job.id,details=f'type={export_type}')
+    return _export_job_payload(job)
+@app.get('/exports')
+def export_jobs(s:Session=Depends(active),db:Db=Depends(db_session)):
+    return {'items':[_export_job_payload(job) for job in db.scalars(select(ExportJob).where(ExportJob.session_id==s.id).order_by(ExportJob.created_at.desc()).limit(50)).all()]}
+@app.get('/exports/{job_id}/download')
+def export_download(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
+    job=db.get(ExportJob,job_id)
+    if not job or job.session_id!=s.id or job.status!='COMPLETED' or not job.filename: raise HTTPException(404,'EXPORT_NOT_READY')
+    output=settings.export_root/job.filename
+    if not output.is_file(): raise HTTPException(404,'EXPORT_FILE_NOT_FOUND')
     return FileResponse(output,filename=output.name,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 @app.get('/scan/{job_id}')
 def scan_job(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
@@ -396,6 +485,14 @@ def cancel(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
     if not j or j.session_id!=s.id: raise HTTPException(404,'JOB_NOT_FOUND')
     if j.status in ('PENDING','QUEUED','RUNNING'): j.status='CANCELLED'; j.end_time=datetime.utcnow(); db.commit()
     return {'id':j.id,'status':j.status}
+@app.post('/scan/{job_id}/retry-failed')
+def retry_scan_failed(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
+    require(s,'OPERATOR','ADMIN')
+    if not db.scalar(select(ScanJob.id).where(ScanJob.id==job_id,ScanJob.session_id==s.id)): raise HTTPException(404,'JOB_NOT_FOUND')
+    ids=list(db.scalars(select(ScanResult.node_id).where(ScanResult.scan_job_id==job_id,ScanResult.status.in_(['ERROR','UNREACHABLE']),ScanResult.node_id.is_not(None)).distinct()).all())
+    if not ids: raise HTTPException(409,'NO_FAILED_NODES_TO_RETRY')
+    value=create_job(ids,s,db); audit(db,s,'PROCESS_SCAN_RETRY','NODE',len(ids),value['job_id'],details=f'source_job={job_id}')
+    return value
 @app.post('/export/{job_id}')
 def make_export(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
     j=db.get(ScanJob,job_id)
@@ -419,34 +516,41 @@ def history(s:Session=Depends(active),db:Db=Depends(db_session)):
 def history_one(job_id:str,s:Session=Depends(active),db:Db=Depends(db_session)): return scan_job(job_id,s,db)
 @app.get('/reports/summary')
 def report_summary(period:str|None=None,s:Session=Depends(active),db:Db=Depends(db_session)):
-    log.info('report_summary_requested session_id=%s',s.id); return report_service.summary(db,s.id,period)
+    scope=report_scope_ids(db,s); log.info('report_summary_requested session_id=%s scope_sessions=%s',s.id,len(scope)); return report_service.summary(db,scope,period)
+@app.get('/admin/report-performance')
+def report_performance(s:Session=Depends(active),db:Db=Depends(db_session)):
+    require(s,'ADMIN'); scope=report_scope_ids(db,s); started=datetime.utcnow(); report_service.summary(db,scope); process_ms=round((datetime.utcnow()-started).total_seconds()*1000,2)
+    started=datetime.utcnow(); compute_report_service.summary(db,scope); compute_ms=round((datetime.utcnow()-started).total_seconds()*1000,2)
+    plan=db.execute(text('EXPLAIN SELECT node_id, MAX(id) FROM compute_discovery_results WHERE session_id=:session_id GROUP BY node_id'),{'session_id':s.id}).mappings().all()
+    return {'timing_ms':{'process_summary':process_ms,'compute_summary':compute_ms},'compute_latest_explain':[dict(x) for x in plan],
+      'expected_indexes':['ix_nodes_session_hostname','ix_scan_results_job_node_status','ix_compute_discovery_results_session_node_time']}
 @app.get('/reports/hosts')
 def report_hosts(page:int=Query(1,ge=1),page_size:int=Query(50,ge=1,le=200),status:str|None=None,search:str|None=Query(None,max_length=255),period:str|None=None,s:Session=Depends(active),db:Db=Depends(db_session)):
     if status and status not in {'SAFE','WARNING','ERROR','UNKNOWN'}: raise HTTPException(400,'INVALID_STATUS')
-    log.info('report_hosts_requested session_id=%s',s.id); return report_service.hosts(db,s.id,page,page_size,status,search,period)
+    scope=report_scope_ids(db,s); log.info('report_hosts_requested session_id=%s scope_sessions=%s',s.id,len(scope)); return report_service.hosts(db,scope,page,page_size,status,search,period)
 @app.get('/reports/hosts/{node_id}')
 def report_host(node_id:int,s:Session=Depends(active),db:Db=Depends(db_session)):
-    value=report_service.host_detail(db,s.id,node_id)
+    value=report_service.host_detail(db,report_scope_ids(db,s),node_id)
     if not value: raise HTTPException(404,'REPORT_HOST_NOT_FOUND')
     log.info('report_host_detail_requested session_id=%s node=%s',s.id,node_id); return value
 @app.get('/reports/hosts/{node_id}/scans')
 def report_host_scans(node_id:int,s:Session=Depends(active),db:Db=Depends(db_session)):
-    value=report_service.host_detail(db,s.id,node_id)
+    value=report_service.host_detail(db,report_scope_ids(db,s),node_id)
     if not value: raise HTTPException(404,'REPORT_HOST_NOT_FOUND')
     return value['history']
 @app.get('/reports/scans/{scan_id}')
 def report_scan(scan_id:str,s:Session=Depends(active),db:Db=Depends(db_session)):
-    value=report_service.scan_detail(db,s.id,scan_id)
+    value=report_service.scan_detail(db,report_scope_ids(db,s),scan_id)
     if not value: raise HTTPException(404,'REPORT_SCAN_NOT_FOUND')
     return value
 @app.get('/reports/export')
 def report_export(search:str|None=None,status:str|None=None,s:Session=Depends(active),db:Db=Depends(db_session)):
-    log.info('report_export_started session_id=%s',s.id); path=report_service.export_report(db,s.id,search=search,status=status); audit(db,s,'REPORT_EXPORT','PROCESS_SCAN'); log.info('report_export_completed session_id=%s',s.id); return FileResponse(path,filename=path.name,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    scope=report_scope_ids(db,s); log.info('report_export_started session_id=%s',s.id); path=report_service.export_report(db,scope,search=search,status=status); audit(db,s,'REPORT_EXPORT','PROCESS_SCAN'); log.info('report_export_completed session_id=%s',s.id); return FileResponse(path,filename=path.name,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 @app.post('/reports/export')
 def report_export_selected(body:ReportExportRequest,s:Session=Depends(active),db:Db=Depends(db_session)):
-    ids=list(dict.fromkeys(body.node_ids)); found=set(db.scalars(select(Node.id).where(Node.session_id==s.id,Node.id.in_(ids))).all())
+    scope=report_scope_ids(db,s); ids=list(dict.fromkeys(body.node_ids)); found=set(db.scalars(select(Node.id).where(Node.session_id.in_(scope),Node.id.in_(ids))).all())
     if found!=set(ids): raise HTTPException(404,'NODE_NOT_FOUND')
-    path=report_service.export_report(db,s.id,node_ids=ids)
+    path=report_service.export_report(db,scope,node_ids=ids)
     return FileResponse(path,filename=path.name,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 def _remove_report_nodes(ids,s,db):
     require(s,'ADMIN')
@@ -462,8 +566,9 @@ def report_remove_one(node_id:int,s:Session=Depends(active),db:Db=Depends(db_ses
 def report_remove(body:ReportRemoveRequest,s:Session=Depends(active),db:Db=Depends(db_session)): return _remove_report_nodes(body.node_ids,s,db)
 @app.get('/reports/hosts/{node_id}/export')
 def report_host_export(node_id:int,s:Session=Depends(active),db:Db=Depends(db_session)):
-    if not report_service.host_detail(db,s.id,node_id): raise HTTPException(404,'REPORT_HOST_NOT_FOUND')
-    path=report_service.export_report(db,s.id,node_id); return FileResponse(path,filename=path.name)
+    scope=report_scope_ids(db,s)
+    if not report_service.host_detail(db,scope,node_id): raise HTTPException(404,'REPORT_HOST_NOT_FOUND')
+    path=report_service.export_report(db,scope,node_id); return FileResponse(path,filename=path.name)
 
 _service_config_nodes={}
 def _service_job_dict(job,db):
@@ -517,6 +622,66 @@ def _create_service_job(body,operation,s,db):
     if name and any(ord(ch)<32 for ch in name): raise HTTPException(422,'INVALID_JOB_NAME')
     name=name or f'Service {operation.title()} - {datetime.utcnow():%Y-%m-%d %H:%M}'
     j=ServiceConfigJob(id=str(uuid.uuid4()),session_id=s.id,created_by=s.username,job_name=name,operation=operation,status='QUEUED',restart_requested=body.restart_after_apply if operation=='CONFIGURE' else False,total_nodes=len(ids),created_at=datetime.utcnow());db.add(j);db.commit();_service_config_nodes[j.id]=ids;threading.Thread(target=_execute_service_job,args=(j.id,),daemon=True).start();return {'job_id':j.id,'job_name':j.job_name,'job_type':f'SERVICE_{operation}','status':'QUEUED','total_nodes':len(ids),'restart_requested':j.restart_requested}
+
+def run_scheduled_checks():
+    """Create durable scan/discovery jobs for due schedules with an active session."""
+    db=SessionLocal(); now=datetime.utcnow()
+    try:
+        due=db.scalars(select(ScheduledCheck).where(ScheduledCheck.enabled.is_(True),or_(ScheduledCheck.next_run_at.is_(None),ScheduledCheck.next_run_at<=now))).all()
+        for schedule in due:
+            schedule.last_run_at=now; schedule.next_run_at=now+timedelta(minutes=schedule.interval_minutes)
+            session=db.get(Session,schedule.session_id)
+            try:
+                if not session or session.status!='ACTIVE' or (session.expires_at and session.expires_at<now): raise RuntimeError('SESSION_NOT_ACTIVE')
+                if schedule.operation=='PROCESS_SCAN': value=create_job(list(schedule.node_ids or []),session,db)
+                else: value=create_compute_job(SimpleNamespace(node_ids=list(schedule.node_ids or []),job_name=f'Scheduled {schedule.name} - {now:%Y-%m-%d %H:%M}'),session,db)
+                schedule.last_job_id=value['job_id']; schedule.last_status='QUEUED'; schedule.last_error=None
+                audit(db,session,'SCHEDULED_CHECK_CREATE','NODE',len(schedule.node_ids or []),value['job_id'],'SUCCESS',f'schedule_id={schedule.id}; operation={schedule.operation}')
+            except Exception as exc:
+                schedule.last_status='FAILED'; schedule.last_error=str(exc)[:500]; log.exception('scheduled_check_failed schedule_id=%s',schedule.id)
+            db.commit()
+    finally: db.close()
+
+@app.get('/scheduled-checks')
+def scheduled_checks(s:Session=Depends(active),db:Db=Depends(db_session)):
+    rows=db.scalars(select(ScheduledCheck).where(ScheduledCheck.session_id==s.id).order_by(ScheduledCheck.created_at.desc())).all()
+    return {'items':[{'id':x.id,'name':x.name,'operation':x.operation,'node_ids':x.node_ids,'interval_minutes':x.interval_minutes,'enabled':x.enabled,'next_run_at':x.next_run_at,'last_run_at':x.last_run_at,'last_job_id':x.last_job_id,'last_status':x.last_status,'last_error':x.last_error} for x in rows]}
+@app.post('/scheduled-checks')
+def create_scheduled_check(body:dict,s:Session=Depends(active),db:Db=Depends(db_session)):
+    require(s,'OPERATOR','ADMIN'); name=str(body.get('name','')).strip(); operation=str(body.get('operation','')).upper(); ids=list(dict.fromkeys(body.get('node_ids') or [])); interval=body.get('interval_minutes')
+    if not name or len(name)>150 or operation not in {'PROCESS_SCAN','COMPUTE_DISCOVERY'} or not isinstance(interval,int) or not 5<=interval<=10080 or not ids: raise HTTPException(422,'INVALID_SCHEDULE')
+    found=set(db.scalars(select(Node.id).where(Node.session_id==s.id,Node.id.in_(ids))).all())
+    if found!=set(ids): raise HTTPException(404,'NODE_NOT_FOUND')
+    now=datetime.utcnow(); row=ScheduledCheck(session_id=s.id,created_by=s.username,name=name,operation=operation,node_ids=ids,interval_minutes=interval,enabled=True,next_run_at=now+timedelta(minutes=interval),created_at=now,updated_at=now)
+    db.add(row); db.commit(); audit(db,s,'SCHEDULE_CREATE','SCHEDULE',len(ids),details=f'schedule_id={row.id}; operation={operation}; interval={interval}')
+    return {'id':row.id,'name':row.name,'next_run_at':row.next_run_at}
+@app.patch('/scheduled-checks/{schedule_id}')
+def update_scheduled_check(schedule_id:int,body:dict,s:Session=Depends(active),db:Db=Depends(db_session)):
+    require(s,'OPERATOR','ADMIN'); row=db.get(ScheduledCheck,schedule_id)
+    if not row or row.session_id!=s.id: raise HTTPException(404,'SCHEDULE_NOT_FOUND')
+    if 'enabled' in body: row.enabled=bool(body['enabled'])
+    if 'interval_minutes' in body:
+        interval=body['interval_minutes']
+        if not isinstance(interval,int) or not 5<=interval<=10080: raise HTTPException(422,'INVALID_INTERVAL')
+        row.interval_minutes=interval; row.next_run_at=datetime.utcnow()+timedelta(minutes=interval)
+    row.updated_at=datetime.utcnow(); db.commit(); audit(db,s,'SCHEDULE_UPDATE','SCHEDULE',1,details=f'schedule_id={row.id}; enabled={row.enabled}')
+    return {'id':row.id,'enabled':row.enabled,'next_run_at':row.next_run_at}
+@app.delete('/scheduled-checks/{schedule_id}')
+def delete_scheduled_check(schedule_id:int,s:Session=Depends(active),db:Db=Depends(db_session)):
+    require(s,'OPERATOR','ADMIN'); row=db.get(ScheduledCheck,schedule_id)
+    if not row or row.session_id!=s.id: raise HTTPException(404,'SCHEDULE_NOT_FOUND')
+    db.delete(row); db.commit(); audit(db,s,'SCHEDULE_DELETE','SCHEDULE',1,details=f'schedule_id={schedule_id}')
+    return {'status':'DELETED'}
+@app.get('/scheduled-checks/alerts')
+def scheduled_alerts(s:Session=Depends(active),db:Db=Depends(db_session)):
+    alerts=[]
+    for row in db.scalars(select(ScheduledCheck).where(ScheduledCheck.session_id==s.id,ScheduledCheck.enabled.is_(True))).all():
+        if row.last_status=='FAILED': alerts.append({'schedule_id':row.id,'name':row.name,'severity':'ERROR','message':row.last_error or 'Không tạo được scheduled job.'})
+        elif row.last_job_id:
+            job=db.get(ScanJob,row.last_job_id) if row.operation=='PROCESS_SCAN' else db.get(ComputeDiscoveryJob,row.last_job_id)
+            failed=(job.error_nodes+job.unreachable_nodes) if isinstance(job,ScanJob) else (job.failed_nodes if job else 0)
+            if job and job.status in ('FAILED','COMPLETED') and failed: alerts.append({'schedule_id':row.id,'name':row.name,'severity':'WARNING','message':f'Job {row.last_job_id} có {failed} node lỗi/không kết nối.'})
+    return {'items':alerts}
 @app.get('/service-config/nodes')
 def service_nodes(search:str='',status:str='',page:int=Query(1,ge=1),page_size:int=Query(50,ge=1,le=200),s:Session=Depends(active),db:Db=Depends(db_session)):
     term=search.strip(); stmt=select(Node).where(Node.session_id==s.id)
