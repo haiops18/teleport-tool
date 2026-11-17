@@ -21,7 +21,7 @@ services:
       retries: 10
       start_period: 30s
   backend:
-    image: teleport-cgroup-scanner-backend:20261022-p2
+    image: teleport-cgroup-scanner-backend:20261117-networkctl
     restart: unless-stopped
     env_file: .env
     environment:
